@@ -4000,3 +4000,18 @@ fn exit_pipe_turns_the_command_row_red_and_persists_it_for_later_tabs() {
     let outcome = runtime.exit_pipe(&stray);
     assert!(!outcome.render && outcome.effects.is_empty());
 }
+
+#[test]
+fn pane_attention_changed_renders_only_on_a_change() {
+    let mut rt = runtime_with_granted_permission();
+    rt.tabs_changed(vec![tab(0, "api", true)]);
+    let working = crate::attention::PaneAttention {
+        status: Status::Running,
+        source: crate::attention::Source::Program,
+        text: "Thinking".into(),
+        app: Some("pi".into()),
+        ..Default::default()
+    };
+    assert!(rt.attention_changed(7, working.clone()).render);
+    assert!(!rt.attention_changed(7, working).render);
+}

@@ -46,9 +46,11 @@ The plugin's session-state module (`crates/plugin/src/radar_state.rs`): the
 current view of tabs, live panes, observations, and snapshot serialization. It
 composes `StatusStore` (pushed status) and `CommandStore` (observed commands),
 both thin wrappers over one `ObservationStore` in `crates/core`, plus
-`TabNamer`. The "status wins over command" precedence between the stores lives
-in exactly one place, `RadarState::resolve`, which both `tab_display` and
-`notify_views` read through.
+`TabNamer`, and the latest OSC 7501 program status per pane (`native`, derived
+in `crates/plugin/src/attention.rs`). The precedence between those sources
+(active status pipe, then active OSC 7501, then idle pipe, then observed
+command, then idle OSC 7501) lives in exactly one place, `RadarState::resolve`,
+which both `tab_display` and `notify_views` read through.
 
 Focus never drives rail state. A finished pane's status clears only through
 shared inputs (a new broadcast, the return-to-shell exit-clear, a prune), so

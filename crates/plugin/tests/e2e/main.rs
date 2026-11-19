@@ -11,7 +11,7 @@
 //   just test-e2e
 //
 // Prerequisites:
-//   - `zellij` 0.44.x on PATH
+//   - `zellij` 0.46.x on PATH
 //   - The plugin wasm already built:
 //     `cargo build --release --target wasm32-wasip1`
 
@@ -1244,9 +1244,10 @@ fn dispatched_grant_float_enables_ungranted_attached_session() {
 /// `surface_active` — the same tint implicated in the report) and reads the
 /// OUTER vt100 screen — the terminal's own view of what Zellij emitted, not
 /// anything internal to the plugin. It pins: painted-last-col ==
-/// pane-last-col (31, since `size=32 borderless=true` gives the pane
-/// on-screen columns `0..=31`) on both the header row and the focused card's
-/// row.
+/// pane-last-col (30: under Zellij 0.46's default `pane_frame_style
+/// "titles"`, a `size=32 borderless=true` pane that is not on the right edge
+/// keeps column 31 for the boundary, so its content is columns `0..=30`) on
+/// both the header row and the focused card's row.
 ///
 /// A 41-outer-width sweep and live mid-session resizes were also run during
 /// the investigation and found zero gap at every point; those aren't kept
@@ -1310,8 +1311,11 @@ fn rail_paints_every_column_of_its_pane() {
             .collect()
     }
 
+    // End of the painted run that starts at col 0: since Zellij 0.46 the
+    // sibling pane paints its own background, so "last painted col" overall
+    // would land in the sibling.
     fn last_painted_col(dump: &[(u16, vt100::Color, String)]) -> Option<u16> {
-        dump.iter().rev().find(|(_, bg, _)| !matches!(bg, vt100::Color::Default)).map(|(c, _, _)| *c)
+        dump.iter().take_while(|(_, bg, _)| !matches!(bg, vt100::Color::Default)).last().map(|(c, _, _)| *c)
     }
 
     fn fmt_dump(dump: &[(u16, vt100::Color, String)]) -> String {
@@ -1338,11 +1342,11 @@ fn rail_paints_every_column_of_its_pane() {
     let header_last = last_painted_col(&header_dump);
     let card_last = last_painted_col(&card_dump);
 
-    // The rail pane is `size=32 borderless=true`. Borderless means Zellij
-    // reserves no column for chrome, so the pane's on-screen column range as
-    // the OUTER terminal sees it should be exactly [0, 31] (32 columns), and
-    // column 32 onward belongs to the sibling content pane.
-    const EXPECTED_PANE_LAST_COL: u16 = 31; // 0-indexed; 32 columns total.
+    // The rail pane is `size=32 borderless=true`. Under the default
+    // `pane_frame_style "titles"` Zellij still reserves the pane's last column
+    // for the boundary to the sibling (`pane_content_offset` in
+    // zellij-server's tiled_panes), so the plugin gets 31 columns: [0, 30].
+    const EXPECTED_PANE_LAST_COL: u16 = 30; // 0-indexed; 31 content columns.
 
     eprintln!(
         "[e2e] header last painted col = {:?} (expected pane last col = {})",
@@ -1372,7 +1376,7 @@ fn rail_paints_every_column_of_its_pane() {
         header_last,
         Some(EXPECTED_PANE_LAST_COL),
         "VERDICT DATA: header row's last painted column is {header_last:?}, expected \
-         {EXPECTED_PANE_LAST_COL} (pane region's last column, size=32 borderless=true). \
+         {EXPECTED_PANE_LAST_COL} (pane content's last column, size=32 borderless=true). \
          If this is Some(n) with n < {EXPECTED_PANE_LAST_COL}, the plugin/harness paints \
          exactly up to col n and the remaining columns up to {EXPECTED_PANE_LAST_COL} are \
          unpainted WITHIN the pane region as this outer terminal sees it -> plugin \
@@ -1686,4 +1690,46 @@ fn dead_peer_presence_file_is_reaped_through_the_real_cache_mount() {
         presence.exists()
     );
     eprintln!("[e2e] PASS: dead peer reaped from the badge and unlinked from the shared /cache");
+}
+
+/// OSC 7501 end to end: a program writes the Program Status Protocol sequence
+/// to its own terminal (no pipe, no hooks, which is how an agent inside a VM
+/// reaches the host's Zellij), and the rail shows its `msg` from the next
+/// `PaneUpdate`. Then a status-pipe broadcast for the same pane takes the row
+/// over, pinning the documented precedence (active pipe over active OSC 7501)
+/// on a live server.
+#[test]
+#[ignore = "e2e: requires zellij + built wasm; run via `just test-e2e`"]
+fn osc_7501_program_status_renders_and_yields_to_the_pipe() {
+    use std::time::Duration;
+    let wasm = plugin_wasm_path();
+    assert!(
+        wasm.exists(),
+        "Plugin wasm not found at {wasm:?}. Build it:\n  cargo build --release --target wasm32-wasip1 -p zj-radar-plugin"
+    );
+    let temp_home = pre_grant_permissions(&wasm);
+    let session_name = format!("zjr_osc7501_{}", std::process::id());
+    let session = ZellijSession::start(&session_name, &sidebar_layout(&wasm), &wasm, temp_home);
+    let pane_id = session.discover_terminal_pane_id();
+
+    // `msg` is base64 ("osc-e2e-row"), so the typed command line never carries
+    // the plain needle: a match in the rail is the decoded record.
+    session.run_action(&["write-chars", r"printf '\033]7501;state=working:app=codex:msg=b3NjLWUyZS1yb3c=\033\\'"]);
+    session.run_action(&["write", "13"]);
+    let shown = session.wait_for_sidebar(32, "osc-e2e-row", Duration::from_secs(10));
+    let sidebar = sidebar_region(&session.screen(), 32);
+    eprintln!("[e2e] rail after OSC 7501:\n{sidebar}");
+    assert!(shown, "the rail should show the OSC 7501 msg;\nsidebar:\n{sidebar}");
+
+    let payload = format!(
+        r#"{{"v":1,"source":"claude","pane":{{"type":"terminal","id":{pane_id}}},"status":"running","repo":"web","branch":"main","msg":"from-hooks"}}"#
+    );
+    session.pipe_status(&payload);
+    let took_over = session.wait_until(Duration::from_secs(5), |s| {
+        let rail = sidebar_region(&s.screen(), 32);
+        rail.contains("from-hooks") && !rail.contains("osc-e2e-row")
+    });
+    let sidebar = sidebar_region(&session.screen(), 32);
+    eprintln!("[e2e] rail after the pipe broadcast:\n{sidebar}");
+    assert!(took_over, "an active status-pipe row should win over OSC 7501;\nsidebar:\n{sidebar}");
 }

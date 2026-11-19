@@ -5,8 +5,8 @@ your layout, and the permission grant. Agent status comes from a separate
 install, the [producer](producers.md). The copy-paste path is the README's
 [Quick start](../README.md#quick-start).
 
-**Requirements:** Zellij 0.44.3 or newer (`zellij --version`). Earlier 0.44
-patches let the sidebar pop out of its column during layout swaps; newer
+**Requirements:** Zellij 0.46.0 or newer (`zellij --version`). 0.46 is the
+first release that reports OSC 7501 program status to plugins; newer
 releases keep compiled plugins working. `--download` needs `curl` or `wget`.
 
 ## Recommended: install the CLI, then `setup zellij --download`
@@ -215,7 +215,7 @@ readable floating pane. Details in
 ```
 zj-radar setup zellij --check
 zellij:
-  ok zellij binary: found on PATH (zellij 0.44.3)
+  ok zellij binary: found on PATH (zellij 0.46.0)
   ok alias: radar plugin alias present in config.kdl
   ok wasm: wasm plugin file present
   missing layout: default layout does not have the radar rail — run `zj-radar setup zellij` or paste the snippet
@@ -225,7 +225,7 @@ zellij:
 
 Items are `ok`, `warn`, or `missing`:
 
-- **zellij binary**: on `PATH`; warns below 0.44.3.
+- **zellij binary**: on `PATH`; warns below 0.46.0.
 - **alias**: `radar` alias in `config.kdl`; warns if it points at a
   `/nix/store/` path, since that grant dies on the next rebuild.
 - **wasm**: file present at the stable path.

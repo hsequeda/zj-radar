@@ -190,6 +190,7 @@ fn exited_pane_root_clears_its_pushed_status() {
         live: HashSet::from([7, 8]),
         theme: None,
         exits: vec![(7, Some(130)), (8, Some(0))],
+        native: HashMap::new(),
     };
     let change = radar.panes_changed(update, 2, 100, config::NamingMode::Off);
 
@@ -293,6 +294,7 @@ fn active_tab_focus_is_the_only_global_focus_transition() {
         live: HashSet::from([1, 2]),
         theme: None,
         exits: Vec::new(),
+        native: HashMap::new(),
     };
 
     radar.panes_changed(update, 7, 0, config::NamingMode::Off);
@@ -360,7 +362,7 @@ fn managed_naming_skips_manual_names_but_force_overrides() {
 
 fn pane_update(tab_panes: HashMap<usize, Vec<TerminalPane>>) -> PaneUpdate {
     let live = tab_panes.values().flat_map(|panes| panes.iter().map(|p| p.id)).collect();
-    PaneUpdate { tab_panes, live, theme: None, exits: Vec::new() }
+    PaneUpdate { tab_panes, live, theme: None, exits: Vec::new(), native: HashMap::new() }
 }
 
 #[test]
@@ -529,6 +531,7 @@ fn panes_changed_persists_when_an_exit_displaces_a_completion() {
         live: HashSet::from([1]),
         theme: None,
         exits: vec![(1, Some(0))],
+        native: HashMap::new(),
     };
     let change = radar.panes_changed(update, 5, 200, config::NamingMode::Off);
     assert!(change.snapshot == SnapshotWrite::Now, "an exit that displaced a completion persists");
@@ -821,6 +824,7 @@ fn snapshot_merge_drops_existing_dead_panes_after_live_update() {
             live: HashSet::from([2]),
             theme: None,
             exits: Vec::new(),
+            native: HashMap::new(),
         },
         3,
         0,
@@ -1424,6 +1428,7 @@ proptest! {
                         live: live.clone(),
                         theme: None,
                         exits: exits.clone(),
+                        native: HashMap::new(),
                     };
                     st.panes_changed(update, tick, 0, config::NamingMode::Off);
 
@@ -1582,6 +1587,7 @@ fn raw_pane(id: u32, tab_pos: usize) -> RawPane {
         default_fg: None,
         exited: false,
         exit_status: None,
+        attention: None,
     }
 }
 
@@ -1748,6 +1754,7 @@ fn prune_ledgers_completions_with_the_pre_close_tab_name() {
         live: HashSet::new(),
         theme: None,
         exits: Vec::new(),
+        native: HashMap::new(),
     };
     // Two updates: the first absence is the break-pane grace manifest; the
     // second confirms the close and prunes. By then the pane is long gone
@@ -1782,7 +1789,13 @@ fn pending_and_running_never_ledger() {
     assert_eq!(radar.status(2).unwrap().status, Status::Pending);
 
     // Both panes close.
-    let update = PaneUpdate { tab_panes: HashMap::new(), live: HashSet::new(), theme: None, exits: Vec::new() };
+    let update = PaneUpdate {
+        tab_panes: HashMap::new(),
+        live: HashSet::new(),
+        theme: None,
+        exits: Vec::new(),
+        native: HashMap::new(),
+    };
     radar.panes_changed(update, 5, 999, config::NamingMode::Off);
 
     assert!(radar.ledger_is_empty(), "Running/Pending carry nothing to ledger — only Done/Error recede");
@@ -1825,7 +1838,13 @@ fn shadowed_command_completion_never_ledgers() {
     // closes — pruning both stores in the same PaneUpdate. Exactly ONE
     // ledger entry should land: the STATUS one.
     radar.status_mut().apply(payload_in_repo(7, Status::Done, "pinky"), confirm_tick + DONE_TTL_TICKS, 950);
-    let update = PaneUpdate { tab_panes: HashMap::new(), live: HashSet::new(), theme: None, exits: Vec::new() };
+    let update = PaneUpdate {
+        tab_panes: HashMap::new(),
+        live: HashSet::new(),
+        theme: None,
+        exits: Vec::new(),
+        native: HashMap::new(),
+    };
     // Second absence confirms the close (the first is the break-pane grace).
     radar.panes_changed(update.clone(), confirm_tick + DONE_TTL_TICKS + 1, 999, config::NamingMode::Off);
     radar.panes_changed(update, confirm_tick + DONE_TTL_TICKS + 2, 999, config::NamingMode::Off);
@@ -2032,4 +2051,254 @@ fn exit_pipe_ignores_malformed_and_unmatched_reports() {
     let report = crate::exit::ExitReport { pane_id: 4, exit: 1, programs: vec!["cargo".into()] };
     assert!(radar.exit_pipe(&report.to_wire(), 1, 0).is_none(), "no row on the pane");
     assert!(radar.command(4).is_none());
+}
+
+// ── Native attention (Zellij ≥ 0.46) ──
+
+fn native_working(app: &str, text: &str) -> crate::attention::NativePane {
+    use crate::attention::{NativePane, PaneAttention, Record, Source};
+    NativePane {
+        attention: PaneAttention {
+            status: Status::Running,
+            source: Source::Program,
+            text: text.into(),
+            app: Some(app.into()),
+            ..PaneAttention::default()
+        },
+        records: vec![Record { status: Status::Running, app: Some(app.into()), ..Record::default() }],
+    }
+}
+
+fn native_update(panes: Vec<(u32, crate::attention::NativePane)>) -> PaneUpdate {
+    let mut update = pane_update(HashMap::from([(0, panes.iter().map(|(id, _)| pane(*id)).collect())]));
+    update.native = panes.into_iter().collect();
+    update
+}
+
+/// Which source a resolved row came from, told apart by the msg each sets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Winner {
+    Pipe,
+    Native,
+    Command,
+}
+
+#[test]
+fn source_precedence_is_active_pipe_then_active_native_then_the_rest() {
+    let cases = [
+        ("active pipe beats active native", Some(Status::Done), Some(Status::Running), false, Winner::Pipe),
+        ("active pipe beats native and command", Some(Status::Running), Some(Status::Pending), true, Winner::Pipe),
+        ("active native beats idle pipe", Some(Status::Idle), Some(Status::Pending), false, Winner::Native),
+        ("active native beats command", None, Some(Status::Running), true, Winner::Native),
+        ("native alone (hooks out of reach)", None, Some(Status::Running), false, Winner::Native),
+        ("idle pipe beats idle native", Some(Status::Idle), Some(Status::Idle), false, Winner::Pipe),
+        ("command beats idle native", None, Some(Status::Idle), true, Winner::Command),
+        ("idle pipe beats command", Some(Status::Idle), None, true, Winner::Pipe),
+    ];
+    for (name, pipe, native, command, want) in cases {
+        let mut radar = RadarState::default();
+        radar.tabs_changed(vec![tab(10, 0, "Tab #1", true)]);
+        radar.set_tab_panes_for_position(0, vec![pane(7)]);
+        if command {
+            radar.command_changed(7, &["cargo".into(), "build".into()], true, 1);
+            radar.timer(1 + DEBOUNCE_TICKS, 0);
+        }
+        if let Some(status) = pipe {
+            radar.status_mut().apply(payload_in_repo(7, status, "repo"), 1, 0);
+        }
+        let mut native_pane = native_working("codex", "native");
+        if let Some(status) = native {
+            native_pane.attention.status = status;
+            native_pane.records[0].status = status;
+            native_pane.records[0].msg = Some("native".into());
+        }
+        let mut update = native_update(if native.is_some() { vec![(7, native_pane)] } else { vec![] });
+        update.tab_panes.insert(0, vec![pane(7)]);
+        update.live.insert(7);
+        radar.panes_changed(update, 2 + DEBOUNCE_TICKS, 0, config::NamingMode::Off);
+
+        let obs = radar.resolve(7).unwrap_or_else(|| panic!("{name}: no row"));
+        let got = match (obs.origin, obs.msg.as_str()) {
+            (crate::observation::ObservationOrigin::Command, _) => Winner::Command,
+            (_, "working") => Winner::Pipe,
+            (_, "native") => Winner::Native,
+            other => panic!("{name}: unexpected row {other:?}"),
+        };
+        assert_eq!(got, want, "{name}: resolved {:?} / {:?}", obs.status, obs.msg);
+    }
+}
+
+#[test]
+fn native_row_shows_the_program_and_its_msg() {
+    let mut radar = RadarState::default();
+    radar.tabs_changed(vec![tab(10, 0, "Tab #1", true)]);
+    let mut native = native_working("claude-code", "working: Reading files");
+    native.records[0].msg = Some("Reading files".into());
+    radar.panes_changed(native_update(vec![(7, native)]), 2, 0, config::NamingMode::Off);
+    let rows = radar.rows(2);
+    let display = &rows[0].display;
+    assert_eq!(display.status, Status::Running);
+    assert_eq!(display.panes[0].kind(), Kind::Claude);
+    assert_eq!(display.panes[0].msg(), "Reading files");
+    assert!(radar.needs_fast_ticks(), "a native Running row spins");
+}
+
+#[test]
+fn notify_skips_panes_the_native_status_wins_but_not_the_pipe() {
+    let mut radar = RadarState::default();
+    radar.tabs_changed(vec![tab(10, 0, "Tab #1", true)]);
+    // Pane 7: hooks and OSC 7501 both report; the pipe wins, so the plugin
+    // still notifies. Pane 8: an idle pipe row under an active native status;
+    // Zellij notifies for it natively.
+    radar.status_mut().apply(payload_in_repo(7, Status::Done, "repo"), 1, 0);
+    radar.status_mut().apply(payload_in_repo(8, Status::Idle, "repo"), 1, 0);
+    radar.panes_changed(
+        native_update(vec![(7, native_working("codex", "x")), (8, native_working("codex", "y"))]),
+        2,
+        0,
+        config::NamingMode::Off,
+    );
+    let views = radar.notify_views();
+    assert_eq!(views.get(&7).map(|o| o.status), Some(Status::Done));
+    assert!(!views.contains_key(&8));
+}
+
+#[test]
+fn idle_native_pane_falls_back_to_the_stores() {
+    let mut radar = RadarState::default();
+    radar.tabs_changed(vec![tab(10, 0, "Tab #1", true)]);
+    radar.status_mut().apply(payload_in_repo(7, Status::Running, "repo"), 1, 0);
+    radar.panes_changed(
+        native_update(vec![(7, crate::attention::NativePane::default())]),
+        2,
+        0,
+        config::NamingMode::Off,
+    );
+    assert_eq!(radar.rows(2)[0].display.status, Status::Running);
+}
+
+#[test]
+fn native_flip_to_pending_flashes_once() {
+    let mut radar = RadarState::default();
+    radar.tabs_changed(vec![tab(10, 0, "Tab #1", true)]);
+    radar.panes_changed(native_update(vec![(7, native_working("codex", "x"))]), 1, 0, config::NamingMode::Off);
+    let mut pending = native_working("codex", "needs approval");
+    pending.attention.status = Status::Pending;
+    radar.panes_changed(native_update(vec![(7, pending.clone())]), 5, 100, config::NamingMode::Off);
+    assert!(radar.rows(5)[0].flash);
+    assert!(radar.pending_wait_unsaturated(100));
+    radar.timer(7, 0);
+    // A re-reported Pending is not a flip.
+    radar.panes_changed(native_update(vec![(7, pending)]), 8, 100, config::NamingMode::Off);
+    assert!(!radar.rows(8)[0].flash);
+}
+
+fn native_done(app: &str, text: &str) -> crate::attention::NativePane {
+    let mut pane = native_working(app, text);
+    pane.attention.status = Status::Done;
+    pane.attention.since_ms = 50_000;
+    pane.records[0].status = Status::Done;
+    pane
+}
+
+#[test]
+fn a_seen_native_done_enters_the_ledger() {
+    let mut radar = RadarState::default();
+    radar.tabs_changed(vec![tab(10, 0, "api", true)]);
+    radar.panes_changed(
+        native_update(vec![(7, native_done("claude-code", "Turn finished"))]),
+        1,
+        0,
+        config::NamingMode::Off,
+    );
+    assert!(radar.ledger().is_empty(), "a lit Done is still a card fact");
+    // Zellij marks the focused pane seen: same records, attention Idle.
+    let mut seen = native_done("claude-code", "");
+    seen.attention.status = Status::Idle;
+    seen.attention.source = crate::attention::Source::Other;
+    // Zellij also remembers it: the same completion, so still one ledger row.
+    seen.attention.remembered = Some(crate::attention::Remembered {
+        status: Status::Done,
+        text: "done: Turn finished".into(),
+        since_ms: 50_000,
+    });
+    assert!(radar.attention_changed(7, seen.attention.clone(), 2));
+    let lines = radar.ledger_lines();
+    assert_eq!(lines.len(), 1);
+    assert_eq!((lines[0].tab_name.as_str(), lines[0].label.as_str(), lines[0].error), ("api", "Turn finished", false));
+    assert_eq!(lines[0].at_epoch_s, 50);
+    // Re-reporting the Idle state is not a second edge.
+    radar.panes_changed(native_update(vec![(7, seen)]), 3, 0, config::NamingMode::Off);
+    assert_eq!(radar.ledger_lines().len(), 1);
+}
+
+#[test]
+fn a_native_error_pane_that_closes_enters_the_ledger() {
+    let mut radar = RadarState::default();
+    radar.tabs_changed(vec![tab(10, 0, "api", true)]);
+    let mut failed = native_done("codex", "Crashed");
+    failed.attention.status = Status::Error;
+    radar.panes_changed(native_update(vec![(7, failed)]), 1, 0, config::NamingMode::Off);
+    radar.panes_changed(native_update(vec![]), 2, 0, config::NamingMode::Off);
+    let lines = radar.ledger_lines();
+    assert_eq!(lines.len(), 1);
+    assert!(lines[0].error);
+    assert_eq!(lines[0].tab_name, "api");
+}
+
+#[test]
+fn a_done_seen_at_once_enters_the_ledger_from_remembered() {
+    // A focused pane's Done is seen before any update shows it: Working →
+    // Idle, with the Done kept in `remembered`.
+    let mut radar = RadarState::default();
+    radar.tabs_changed(vec![tab(10, 0, "api", true)]);
+    radar.panes_changed(
+        native_update(vec![(7, native_working("claude-code", "Refactor"))]),
+        1,
+        0,
+        config::NamingMode::Off,
+    );
+    let mut seen = native_done("claude-code", "");
+    seen.attention.status = Status::Idle;
+    seen.attention.remembered = Some(crate::attention::Remembered {
+        status: Status::Done,
+        text: "done: Refactor complete".into(),
+        since_ms: 60_000,
+    });
+    radar.panes_changed(native_update(vec![(7, seen.clone())]), 2, 0, config::NamingMode::Off);
+    radar.panes_changed(native_update(vec![(7, seen)]), 3, 0, config::NamingMode::Off);
+    let lines = radar.ledger_lines();
+    assert_eq!(lines.len(), 1, "one completion, however many updates repeat it");
+    assert_eq!((lines[0].label.as_str(), lines[0].at_epoch_s), ("Refactor complete", 60));
+}
+
+#[test]
+fn attention_changed_reaches_a_rail_without_a_manifest() {
+    // A hidden tab's instance gets no `PaneUpdate`, only `PaneAttentionChanged`.
+    let mut radar = RadarState::default();
+    let working = native_working("pi", "Thinking");
+    assert!(radar.attention_changed(7, working.attention.clone(), 1));
+    assert!(radar.needs_fast_ticks());
+    assert!(!radar.attention_changed(7, working.attention, 2), "an identical attention changes nothing");
+}
+
+#[test]
+fn a_hidden_rail_ledgers_on_the_manifest_its_reveal_brings() {
+    // Hidden: no tabs, no manifest, only `PaneAttentionChanged`; on reveal
+    // the manifest comes before the tabs.
+    let mut radar = RadarState::default();
+    let mut seen = native_done("claude-code", "");
+    seen.attention.status = Status::Idle;
+    seen.attention.remembered =
+        Some(crate::attention::Remembered { status: Status::Done, text: "done: Ship it".into(), since_ms: 70_000 });
+    radar.attention_changed(7, seen.attention.clone(), 1);
+    assert!(radar.ledger().is_empty(), "no topology yet: no tab to file it under");
+    // By the reveal Zellij has forgotten the remembered Done.
+    seen.attention.remembered = None;
+    radar.panes_changed(native_update(vec![(7, seen)]), 2, 0, config::NamingMode::Off);
+    assert!(radar.ledger().is_empty());
+    radar.tabs_changed(vec![tab(10, 0, "api", false), tab(20, 1, "web", true)]);
+    let lines = radar.ledger_lines();
+    assert_eq!(lines.len(), 1);
+    assert_eq!((lines[0].tab_name.as_str(), lines[0].label.as_str()), ("api", "Ship it"));
 }

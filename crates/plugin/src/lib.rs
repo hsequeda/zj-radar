@@ -32,6 +32,7 @@ pub(crate) use zj_radar_core::{command, exit, kind, observation, payload, status
 #[cfg(target_arch = "wasm32")]
 pub(crate) use zj_radar_core::pipe;
 
+mod attention;
 mod clock;
 mod config;
 mod control;
@@ -103,6 +104,7 @@ fn input_mode(mode: InputMode) -> mode::Mode {
         InputMode::Search => mode::Mode::Search,
         InputMode::RenameTab => mode::Mode::RenameTab,
         InputMode::RenamePane => mode::Mode::RenamePane,
+        InputMode::RenameSession => mode::Mode::RenameSession,
         InputMode::Session => mode::Mode::Session,
         InputMode::Move => mode::Mode::Move,
         InputMode::Prompt => mode::Mode::Prompt,
@@ -362,6 +364,41 @@ impl State {
     }
 }
 
+/// Zellij's attention status in the rail's vocabulary. Muted panes read Idle.
+#[cfg(target_arch = "wasm32")]
+fn native_status(s: AttentionStatus) -> status::Status {
+    use status::Status;
+    match s {
+        AttentionStatus::Working => Status::Running,
+        AttentionStatus::NeedsYou => Status::Pending,
+        AttentionStatus::Done => Status::Done,
+        AttentionStatus::Failed => Status::Error,
+        AttentionStatus::Idle | AttentionStatus::Quiet | AttentionStatus::NewOutput => Status::Idle,
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn native_attention(a: PaneAttention) -> attention::PaneAttention {
+    attention::PaneAttention {
+        status: native_status(a.effective_status()),
+        source: match a.source {
+            Some(AttentionSource::ProgramStatus) => attention::Source::Program,
+            Some(AttentionSource::ShellCommand | AttentionSource::CommandPane | AttentionSource::ForegroundProcess) => {
+                attention::Source::Command
+            }
+            _ => attention::Source::Other,
+        },
+        text: a.text,
+        app: a.detail.app,
+        since_ms: a.since_ms,
+        remembered: a.remembered.map(|r| attention::Remembered {
+            status: native_status(r.status),
+            text: r.text,
+            since_ms: r.since_ms,
+        }),
+    }
+}
+
 #[cfg(target_arch = "wasm32")]
 impl ZellijPlugin for State {
     fn load(&mut self, config: BTreeMap<String, String>) {
@@ -373,6 +410,9 @@ impl ZellijPlugin for State {
             EventType::Timer,
             EventType::Mouse,
             EventType::PermissionRequestResult,
+            // One pane's attention moved; unlike `PaneUpdate` it reaches the
+            // instances of hidden tabs too (ledger edges, counts).
+            EventType::PaneAttentionChanged,
             // Replaces `SessionUpdate`: stock zj-radar never calls the
             // blocking `get_session_list()` host fn that's the ONLY thing
             // that repopulates `SessionUpdate`'s peer list in zellij 0.44.3
@@ -459,6 +499,22 @@ impl ZellijPlugin for State {
                             default_fg: p.default_fg,
                             exited: p.exited,
                             exit_status: p.exit_status,
+                            attention: Some(attention::NativePane {
+                                records: p
+                                    .program_status
+                                    .into_iter()
+                                    .map(|r| attention::Record {
+                                        status: native_status(r.state().attention_status()),
+                                        id: r.id,
+                                        app: r.app,
+                                        title: r.title,
+                                        msg: r.msg,
+                                        progress: r.progress,
+                                        updated_ms: r.updated_ms,
+                                    })
+                                    .collect(),
+                                attention: native_attention(p.attention),
+                            }),
                         })
                     })
                     .collect();
@@ -518,6 +574,10 @@ impl ZellijPlugin for State {
                     return self.handle_outcome(outcome);
                 }
                 false // plugin panes: nothing observed, nothing to repaint
+            }
+            Event::PaneAttentionChanged(PaneId::Terminal(id), attention) => {
+                let outcome = self.runtime.attention_changed(id, native_attention(attention));
+                self.handle_outcome(outcome)
             }
             Event::CommandChanged(pane_id, command, is_foreground, _clients) => {
                 if let PaneId::Terminal(id) = pane_id {

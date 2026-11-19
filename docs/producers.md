@@ -3,7 +3,9 @@
 The sidebar only displays. A **producer** is whatever broadcasts agent status
 to it. zj-radar ships producers for Claude Code, Codex, Opencode, pi, and omp
 (oh-my-pi), a `notify generic` command for any script, and documents the wire
-format so you can write your own.
+format so you can write your own. It also reads the status any program reports
+to Zellij itself through [OSC 7501](#osc-7501-zellijs-native-program-status),
+which reaches the sidebar from places hooks cannot.
 
 Install the [sidebar](install.md) first. Every producer below needs the
 `zj-radar` CLI on `PATH` except the Claude plugin, which falls back to a
@@ -320,6 +322,94 @@ commands whose program doesn't match the row are left alone.
 - A shell nested inside a running command (`nix develop`, `poetry shell`)
   inherits `ZELLIJ_PANE_ID` and reports into the same pane, so a failure of
   the same program in it (`nix build`) marks the outer, still-running row red.
+
+## OSC 7501: Zellij's native program status
+
+Zellij 0.46 added the Program Status Protocol: a program writes an OSC 7501
+escape sequence to its own terminal, and Zellij keeps a per-pane record of it.
+The sidebar reads those records from every `PaneUpdate` (the
+`ReadApplicationState` permission it already holds), so there is nothing to
+install on the sidebar side.
+
+Because the sequence travels inside the terminal stream, it reaches the host's
+Zellij from anywhere the terminal does: a VM (Lima, a devcontainer), a Docker
+shell, or an `ssh` session. The pipe producers above need `zellij pipe` to talk
+to the host's Zellij, which fails there.
+
+### Emitting it
+
+```text
+ESC ] 7501 ; state=<state>[:app=<app>][:kind=<kind>][:progress=<0-100>][:title=<base64>][:msg=<base64>][:id=<id>] ESC \
+```
+
+- `state`: `working` | `blocked` | `done` | `error` | `idle`, or `clear` to drop
+  the record.
+- `app`: the program, which picks the kind mark: `claude-code` ✳ and the agent
+  tokens of [`notify generic`](#any-script-zj-radar-notify-generic) (`codex`,
+  `opencode`, `pi`, `omp`, `gemini`); `zellij` is a nested or remote Zellij
+  (⇄). Anything else renders `⦿`.
+- `msg`, `title`: base64 (standard alphabet). `msg` becomes the row text.
+- `progress`: kept by Zellij only with `working` or `blocked`. The sidebar puts
+  it ahead of the text while working: `40% · Editing main.rs`.
+- `kind`: `permission` | `question` | `auth`, only with `blocked`.
+- `id`: a child record (`build`, `build/test`); without it the record is the
+  pane's root. Child records render as the row's `┊` sub-lines.
+
+From a shell, with the sequence going to the pane's terminal:
+
+```sh
+msg=$(printf '%s' "Editing main.rs" | base64 -w0)
+printf '\033]7501;state=working:app=claude-code:progress=40:msg=%s\033\\' "$msg" > /dev/tty
+```
+
+A hook that runs without a controlling terminal has to write to the pane's tty
+some other way; `> /dev/tty` fails there.
+
+### How it maps onto the rail
+
+| OSC 7501 `state` | Rail status |
+|---|---|
+| `blocked` | needs you (pending) |
+| `working` | running |
+| `done` | done |
+| `error` | error |
+| `idle` | idle |
+
+Only program status counts. Zellij's own shell-command tracking, bells, idle
+rules and watches are left to the rail's [observed
+commands](activity-model.md) and do not create rows. A pane whose root record
+Zellij has marked seen (a `done` you have looked at) reads idle and keeps its
+kind mark.
+
+A `done` or `error` enters the completion ledger when it leaves the row: when
+Zellij marks it seen, when the program moves on, or when the pane closes. A
+focused pane's `done` is seen at once and only reaches the ledger. Zellij also
+sends `PaneAttentionChanged` to the rails of hidden tabs, so their ledgers stay
+current.
+
+### When a pane has more than one source
+
+If an agent reports through both its hooks and OSC 7501, or a command runs in a
+pane a program reports on, the rail picks one observation per pane, highest
+first:
+
+1. an active (non-idle) status-pipe broadcast (the hooks);
+2. an active OSC 7501 status;
+3. an idle status-pipe broadcast;
+4. an observed command;
+5. an idle OSC 7501 root record.
+
+The hooks win while they have something to say because they carry more: repo,
+branch, task, background tasks, and the `✓` acknowledgment, which speaks the
+status pipe. OSC 7501 takes the row whenever the hooks are silent or idle,
+which is always the case for an agent whose hooks cannot reach this Zellij.
+The rule lives in one place, `RadarState::resolve`.
+
+### Notifications
+
+Zellij notifies for program status itself (`attention.desktop_notifications`
+in its config). A pane whose row comes from OSC 7501 does not notify from the
+sidebar as well; one the status pipe wins still does, as before.
 
 ## Writing your own producer
 

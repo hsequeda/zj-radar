@@ -105,7 +105,7 @@ pub struct IsolatedEnvironment {
 
 impl IsolatedEnvironment {
     fn new() -> Self {
-        Self {
+        let env = Self {
             root: EnvironmentRoot::Owned(
                 tempfile::TempDir::new().expect("failed to create isolated Zellij environment"),
             ),
@@ -115,7 +115,20 @@ impl IsolatedEnvironment {
                     .tempdir_in("/tmp")
                     .expect("failed to create isolated Zellij socket dir"),
             ),
-        }
+        };
+        // Zellij ≥ 0.46 opens its desktop-setup wizard over the terminal pane
+        // of a home where it is not the default terminal yet, swallowing every
+        // `write-chars` meant for the shell. Mark the setup as never-show.
+        let data_dir = env.zellij_data_dir();
+        std::fs::create_dir_all(&data_dir).expect("failed to create isolated Zellij data dir");
+        std::fs::write(data_dir.join("desktop_integration.json"), r#"{"flags":["SetupNeverShow"]}"#)
+            .expect("failed to write isolated Zellij desktop-integration state");
+        // Release notes and startup tips cover the pane the same way.
+        let config_dir = env.config_home().join("zellij");
+        std::fs::create_dir_all(&config_dir).expect("failed to create isolated Zellij config dir");
+        std::fs::write(config_dir.join("config.kdl"), "show_release_notes false\nshow_startup_tips false\n")
+            .expect("failed to write isolated Zellij config");
+        env
     }
 
     fn shared(&self) -> Self {
@@ -143,6 +156,15 @@ impl IsolatedEnvironment {
 
     fn socket_dir(&self) -> std::path::PathBuf {
         self.socket.path().to_path_buf()
+    }
+
+    // Zellij's `ProjectDirs::data_dir()`: macOS ignores `XDG_DATA_HOME`.
+    fn zellij_data_dir(&self) -> std::path::PathBuf {
+        if cfg!(target_os = "macos") {
+            self.home().join("Library/Application Support/org.Zellij-Contributors.Zellij")
+        } else {
+            self.data_home().join("zellij")
+        }
     }
 
     fn zellij_cache_dir(&self) -> std::path::PathBuf {
@@ -630,16 +652,16 @@ impl ZellijSession {
 }
 
 /// Fail fast (with a clear message) if `zellij` is missing, and warn loudly if it
-/// is not the 0.44.x series the harness layout KDL and permission-prompt handling
+/// is not the 0.46.x series the harness layout KDL and permission-prompt handling
 /// target. A version skew otherwise surfaces as an opaque `wait_until_ready`
 /// timeout — "the plugin never rendered" — instead of "your zellij is too new".
 fn assert_zellij_version() {
     match Command::new("zellij").arg("--version").output() {
         Ok(out) => {
             let v = String::from_utf8_lossy(&out.stdout);
-            if !v.contains("0.44") {
+            if !v.contains("0.46") {
                 eprintln!(
-                    "[e2e] WARNING: harness targets zellij 0.44.x but found `{}`. \
+                    "[e2e] WARNING: harness targets zellij 0.46.x but found `{}`. \
                      Layout/permission behavior may differ; a timeout below likely means \
                      a version skew, not a plugin regression.",
                     v.trim()
@@ -647,7 +669,7 @@ fn assert_zellij_version() {
             }
         }
         Err(e) => panic!(
-            "[e2e] `zellij` not found on PATH ({e}). Install zellij 0.44.x to run the \
+            "[e2e] `zellij` not found on PATH ({e}). Install zellij 0.46.x to run the \
              live E2E suite (see CONTRIBUTING.md)."
         ),
     }

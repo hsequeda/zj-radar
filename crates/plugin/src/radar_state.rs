@@ -1,6 +1,7 @@
 //! Session radar state: live tabs/panes plus source-specific observations.
 //! No zellij-tile dependency.
 
+use crate::attention::NativePane;
 use crate::command::{CommandStore, EpochSecs, Tick};
 use crate::config;
 use crate::ledger::{Ledger, LedgerEntry, LedgerOutcome};
@@ -82,6 +83,9 @@ pub(crate) struct PaneUpdate {
     pub live: HashSet<u32>,
     pub theme: Option<theme::DerivedColors>,
     pub exits: Vec<(u32, Option<i32>)>,
+    /// Native attention per terminal pane (Zellij ≥ 0.46). A pane missing
+    /// here falls back to the status/command stores (`RadarState::resolve`).
+    pub native: HashMap<u32, NativePane>,
 }
 
 /// One terminal pane as the Zellij host reports it — the few `PaneInfo` fields
@@ -99,6 +103,7 @@ pub(crate) struct RawPane {
     pub default_fg: Option<String>,
     pub exited: bool,
     pub exit_status: Option<i32>,
+    pub attention: Option<NativePane>,
 }
 
 impl PaneUpdate {
@@ -111,6 +116,7 @@ impl PaneUpdate {
         let mut tab_panes: HashMap<usize, Vec<TerminalPane>> = HashMap::new();
         let mut live: HashSet<u32> = HashSet::new();
         let mut exits: Vec<(u32, Option<i32>)> = Vec::new();
+        let mut native: HashMap<u32, NativePane> = HashMap::new();
         let mut focused_colors: Option<(theme::Rgb, theme::Rgb)> = None;
         let mut any_colors: Option<(theme::Rgb, theme::Rgb)> = None;
         for p in panes {
@@ -147,9 +153,12 @@ impl PaneUpdate {
             if p.exited {
                 exits.push((p.id, p.exit_status));
             }
+            if let Some(a) = p.attention {
+                native.insert(p.id, a);
+            }
         }
         let theme = focused_colors.or(any_colors).map(|(bg, fg)| theme::DerivedColors::from_bg_fg(bg, fg));
-        PaneUpdate { tab_panes, live, theme, exits }
+        PaneUpdate { tab_panes, live, theme, exits, native }
     }
 }
 
@@ -230,6 +239,17 @@ const FLASH_TICKS: u64 = 2;
 pub(crate) struct RadarState {
     status: StatusStore,
     command: CommandStore,
+    /// The latest manifest's OSC 7501 program status, for each pane a program
+    /// reports on. Ranks below an active status-pipe observation and above an
+    /// observed command (`resolve`).
+    native: HashMap<u32, TrackedObservation>,
+    /// The raw native attention `native` derives from: the latest manifest,
+    /// with `PaneAttentionChanged` patching a pane's attention in between.
+    native_raw: HashMap<u32, NativePane>,
+    /// Native completions whose pane no known tab holds yet — a hidden rail
+    /// hears `PaneAttentionChanged` before any manifest. Filed once a
+    /// manifest and the tabs seat the pane (`file_unfiled`).
+    unfiled: Vec<(u32, Status, String, u64)>,
     tabs: Vec<RadarTab>,
     tab_panes: HashMap<usize, Vec<TerminalPane>>,
     pane_cwd: HashMap<u32, String>,
@@ -463,6 +483,7 @@ impl RadarState {
         // current set), so `applied` doesn't accrete gone tabs.
         let live: HashSet<TabId> = self.tabs.iter().map(|t| t.id).collect();
         self.namer.retain_tabs(&live);
+        self.file_unfiled();
         RadarChange { render: true, settle: false, ..RadarChange::default() }
     }
 
@@ -554,6 +575,21 @@ impl RadarState {
         }
         self.live_panes = Some(update.live.clone());
         self.tab_panes = update.tab_panes;
+        // A live pane ledgers under its current tab, one gone from the
+        // manifest under the tab it was last seen in. (A hidden rail's first
+        // manifest is the one its reveal brings, so `old_index` can be empty.)
+        self.native_raw = update.native;
+        let mut index = self.pane_tab_index();
+        for (id, tab) in &old_index {
+            index.entry(*id).or_insert_with(|| tab.clone());
+        }
+        let mut ids: Vec<u32> = self.native.keys().chain(self.native_raw.keys()).copied().collect();
+        ids.sort_unstable();
+        ids.dedup();
+        for id in ids {
+            self.native_changed(id, tick, &index);
+        }
+        self.file_unfiled();
         // An absent pane gets one manifest of grace before it's pruned:
         // Zellij's break-pane family reports session state while the moved
         // pane is extracted and in no tab (zellij screen.rs: `extract_pane` →
@@ -661,6 +697,84 @@ impl RadarState {
             self.touch();
         }
         changed
+    }
+
+    /// `PaneAttentionChanged`: one pane's attention moved. Unlike the
+    /// manifest it reaches hidden tabs' instances too, so the ledger and
+    /// counts there stay current. Returns whether rows changed.
+    pub(crate) fn attention_changed(
+        &mut self,
+        pane_id: u32,
+        attention: crate::attention::PaneAttention,
+        tick: u64,
+    ) -> bool {
+        self.native_raw.entry(pane_id).or_default().attention = attention;
+        let index = self.pane_tab_index();
+        let changed = self.native_changed(pane_id, tick, &index);
+        if changed {
+            self.touch();
+        }
+        changed
+    }
+
+    /// Re-derive one pane's native observation from `native_raw` and act on
+    /// the edge: a Done/Error that changes status or disappears leaves the
+    /// card for the ledger (a seen Done reads Idle), and a flip to Pending
+    /// flashes the tab. Returns whether the observation changed.
+    fn native_changed(&mut self, pane_id: u32, tick: u64, index: &HashMap<u32, (TabId, String)>) -> bool {
+        let prev = self.native.remove(&pane_id);
+        let obs = self.native_raw.get(&pane_id).and_then(|p| p.observation(prev.as_ref(), tick));
+        let status = obs.as_ref().map(|o| o.status);
+        let changed = prev != obs;
+        if status == Some(Status::Pending) && prev.as_ref().is_none_or(|p| p.status != Status::Pending) {
+            self.arm_flash(pane_id, tick);
+        }
+        if let Some(obs) = obs {
+            self.native.insert(pane_id, obs);
+        }
+        if let Some(prev) = prev.filter(|p| p.status.is_completion() && Some(p.status) != status) {
+            self.ledger_native(pane_id, prev.status, &prev.msg, prev.completed_epoch_s, index);
+        }
+        let remembered = self.native_raw.get(&pane_id).and_then(|p| p.attention.remembered.clone());
+        if let Some(r) = remembered.filter(|r| r.status.is_completion() && Some(r.status) != status) {
+            self.ledger_native(pane_id, r.status, &r.text, Some(r.since_ms / 1000), index);
+        }
+        changed
+    }
+
+    /// Retry the completions no tab could hold yet: on reveal a rail's
+    /// `PaneUpdate` can come before its first `TabUpdate`, so either may be
+    /// the one that seats the pane.
+    fn file_unfiled(&mut self) {
+        let index = self.pane_tab_index();
+        for (id, status, label, at) in std::mem::take(&mut self.unfiled) {
+            self.ledger_native(id, status, &label, Some(at), &index);
+        }
+    }
+
+    /// File one native completion under the pane's tab. Both edges in
+    /// `native_changed` can report the same completion; `Ledger::push`
+    /// merges them (same pane, outcome and label).
+    fn ledger_native(
+        &mut self,
+        pane_id: u32,
+        status: Status,
+        text: &str,
+        at_epoch_s: Option<u64>,
+        index: &HashMap<u32, (TabId, String)>,
+    ) {
+        let Some(at_epoch_s) = at_epoch_s else { return };
+        let label = crate::attention::completion_label(text).to_string();
+        let Some((tab_id, tab_name)) = index.get(&pane_id) else {
+            // ponytail: unbounded only in theory, a manifest drains it; cap it if hidden rails ever live without one
+            self.unfiled.push((pane_id, status, label, at_epoch_s));
+            return;
+        };
+        let outcome = if status == Status::Error { LedgerOutcome::Error } else { LedgerOutcome::Done };
+        let entry = LedgerEntry { at_epoch_s, outcome, tab_id: *tab_id, tab_name: tab_name.clone(), label, pane_id };
+        if self.ledger.push(entry.sanitized()) {
+            self.touch();
+        }
     }
 
     pub(crate) fn cwd_changed(&mut self, pane_id: u32, path: String, naming: config::NamingMode) -> RadarChange {
@@ -881,7 +995,7 @@ impl RadarState {
     /// meant to (animation vs. a scheduled one-shot are different reasons to
     /// tick, and conflating them would blur what each predicate promises).
     pub(crate) fn needs_fast_ticks(&self) -> bool {
-        self.status.needs_ticks() || self.command.needs_ticks()
+        self.status.needs_ticks() || self.command.needs_ticks() || self.native.values().any(|o| o.animating())
     }
 
     /// Some observation spins at full speed right now: animating
@@ -894,7 +1008,9 @@ impl RadarState {
         let spinning = |o: &TrackedObservation| {
             o.animating() && now_tick.saturating_sub(o.last_change_tick) <= crate::render::EASE_AFTER_TICKS
         };
-        self.status.observations().any(|(_, o)| spinning(o)) || self.command.observations().any(|(_, o)| spinning(o))
+        self.status.observations().any(|(_, o)| spinning(o))
+            || self.command.observations().any(|(_, o)| spinning(o))
+            || self.native.values().any(spinning)
     }
 
     /// Apply the user's `interactive_commands` extras to the command store
@@ -992,23 +1108,45 @@ impl RadarState {
         self.last_focused
     }
 
-    /// THE precedence between observation sources: a status-pipe observation wins
-    /// over a command one for the same pane id. This is the single definition of
-    /// the rule — the one place that knows there is more than one store. Both
-    /// consumers (`tab_display`'s roll-up and `notify_views`) read through it, so
-    /// the precedence can never be encoded two different ways and silently drift.
+    /// THE precedence between observation sources, highest first:
+    ///
+    /// 1. an active (non-Idle) status-pipe observation — the hooks carry repo,
+    ///    branch and background tasks, and the `✓` gesture speaks the pipe;
+    /// 2. an active OSC 7501 program status (`native`) — the only source for an
+    ///    agent whose hooks cannot reach this Zellij (a VM, a container, ssh);
+    /// 3. an Idle status-pipe observation;
+    /// 4. an observed command;
+    /// 5. an Idle OSC 7501 root record.
+    ///
+    /// This is the single definition of the rule — the one place that knows
+    /// there is more than one source. Both consumers (`tab_display`'s roll-up
+    /// and `notify_views`) read through it, so the precedence can never be
+    /// encoded two different ways and silently drift.
     fn resolve(&self, pane_id: u32) -> Option<&TrackedObservation> {
-        self.status.get(pane_id).or_else(|| self.command.get(pane_id))
+        let active = |o: &&TrackedObservation| o.status != Status::Idle;
+        let status = self.status.get(pane_id);
+        let native = self.native.get(&pane_id);
+        status
+            .filter(active)
+            .or_else(|| native.filter(active))
+            .or(status)
+            .or_else(|| self.command.get(pane_id))
+            .or(native)
     }
 
     /// Union of both stores' observations, keyed by pane id, for the notifier.
-    /// A pane CAN appear in both stores; `resolve` applies the system-wide
-    /// "status wins over command" precedence, so a shared id maps to the status
-    /// observation.
+    /// A pane CAN appear in several sources; `resolve` applies the system-wide
+    /// precedence, so a shared id maps to the winning observation.
     pub(crate) fn notify_views(&self) -> std::collections::BTreeMap<u32, &crate::observation::TrackedObservation> {
         let ids: std::collections::BTreeSet<u32> =
             self.command.observations().map(|(id, _)| id).chain(self.status.observations().map(|(id, _)| id)).collect();
-        ids.into_iter().filter_map(|id| self.resolve(id).map(|o| (id, o))).collect()
+        // Zellij notifies natively (`attention.desktop_notifications`): a pane
+        // whose winning observation is its OSC 7501 status never notifies from
+        // here. One the status pipe wins still does.
+        ids.into_iter()
+            .filter_map(|id| self.resolve(id).map(|o| (id, o)))
+            .filter(|(id, o)| !self.native.get(id).is_some_and(|n| std::ptr::eq(*o, n)))
+            .collect()
     }
 
     /// Prepared ledger rows for rendering, newest first. Each row's tab
@@ -1050,7 +1188,7 @@ impl RadarState {
     /// [`ledger_any_unsaturated`](Self::ledger_any_unsaturated): both feed the
     /// Slow cadence, and both freeze at `1h+` so the timer can disarm.
     pub(crate) fn pending_wait_unsaturated(&self, now_epoch_s: u64) -> bool {
-        self.status.observations().any(|(_, o)| {
+        self.status.observations().map(|(_, o)| o).chain(self.native.values()).any(|o| {
             o.status == Status::Pending
                 && o.pending_epoch_s.is_some_and(|t| now_epoch_s.saturating_sub(t) < crate::ledger::SATURATE_S)
         })

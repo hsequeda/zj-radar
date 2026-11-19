@@ -15,7 +15,7 @@
 # before (or regardless of) what `latest` points at.
 set -uo pipefail
 
-ZELLIJ_VERSION="v0.44.3"
+ZELLIJ_VERSION="v0.46.0"
 fail=0
 check() { # check <ok-message> <cmd...>
     local msg="$1"; shift

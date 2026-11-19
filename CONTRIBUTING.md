@@ -40,7 +40,7 @@ the core.
   job builds with exactly that toolchain.
 - For the full suite: `just`, `bats`, `shellcheck`, `jq`, GNU `timeout`
   (`brew install coreutils` on macOS; two bash cases skip without it), and
-  `zellij` ≥ 0.44.3 for the live E2E layer.
+  `zellij` ≥ 0.46.0 for the live E2E layer.
 - Optional: Nix. `nix develop` pins all of the above; `nix flake check` runs
   what the `hermetic` CI job runs.
 

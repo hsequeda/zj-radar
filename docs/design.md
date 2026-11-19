@@ -839,7 +839,7 @@ choice is a flag the consumer projects on, never a fact.
 
 ## 15. Build and packaging
 
-- Rust, `zellij-tile = "0.44"`, target `wasm32-wasip1`. The artifact is a
+- Rust, `zellij-tile = "0.46"`, target `wasm32-wasip1`. The artifact is a
   binary crate, not `cdylib`: Zellij loads plugins as WASI command modules and
   calls `_start`, which `register_plugin!`'s generated `main` provides.
 - Zellij runs one instance per tab per attached client (a detached client's

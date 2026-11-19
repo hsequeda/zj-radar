@@ -42,7 +42,7 @@ already run. It does not launch, wrap, or own your agents.
 
 ## Quick start
 
-Requires Zellij 0.44.3 or newer (`zellij --version`).
+Requires Zellij 0.46.0 or newer (`zellij --version`).
 
 ```sh
 # 1. Install the zj-radar CLI (prebuilt for Linux and Apple Silicon macOS;

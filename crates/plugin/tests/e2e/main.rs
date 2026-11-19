@@ -1687,3 +1687,45 @@ fn dead_peer_presence_file_is_reaped_through_the_real_cache_mount() {
     );
     eprintln!("[e2e] PASS: dead peer reaped from the badge and unlinked from the shared /cache");
 }
+
+/// OSC 7501 end to end: a program writes the Program Status Protocol sequence
+/// to its own terminal (no pipe, no hooks, which is how an agent inside a VM
+/// reaches the host's Zellij), and the rail shows its `msg` from the next
+/// `PaneUpdate`. Then a status-pipe broadcast for the same pane takes the row
+/// over, pinning the documented precedence (active pipe over active OSC 7501)
+/// on a live server.
+#[test]
+#[ignore = "e2e: requires zellij + built wasm; run via `just test-e2e`"]
+fn osc_7501_program_status_renders_and_yields_to_the_pipe() {
+    use std::time::Duration;
+    let wasm = plugin_wasm_path();
+    assert!(
+        wasm.exists(),
+        "Plugin wasm not found at {wasm:?}. Build it:\n  cargo build --release --target wasm32-wasip1 -p zj-radar-plugin"
+    );
+    let temp_home = pre_grant_permissions(&wasm);
+    let session_name = format!("zjr_osc7501_{}", std::process::id());
+    let session = ZellijSession::start(&session_name, &sidebar_layout(&wasm), &wasm, temp_home);
+    let pane_id = session.discover_terminal_pane_id();
+
+    // `msg` is base64 ("osc-e2e-row"), so the typed command line never carries
+    // the plain needle: a match in the rail is the decoded record.
+    session.run_action(&["write-chars", r"printf '\033]7501;state=working:app=codex:msg=b3NjLWUyZS1yb3c=\033\\'"]);
+    session.run_action(&["write", "13"]);
+    let shown = session.wait_for_sidebar(32, "osc-e2e-row", Duration::from_secs(10));
+    let sidebar = sidebar_region(&session.screen(), 32);
+    eprintln!("[e2e] rail after OSC 7501:\n{sidebar}");
+    assert!(shown, "the rail should show the OSC 7501 msg;\nsidebar:\n{sidebar}");
+
+    let payload = format!(
+        r#"{{"v":1,"source":"claude","pane":{{"type":"terminal","id":{pane_id}}},"status":"running","repo":"web","branch":"main","msg":"from-hooks"}}"#
+    );
+    session.pipe_status(&payload);
+    let took_over = session.wait_until(Duration::from_secs(5), |s| {
+        let rail = sidebar_region(&s.screen(), 32);
+        rail.contains("from-hooks") && !rail.contains("osc-e2e-row")
+    });
+    let sidebar = sidebar_region(&session.screen(), 32);
+    eprintln!("[e2e] rail after the pipe broadcast:\n{sidebar}");
+    assert!(took_over, "an active status-pipe row should win over OSC 7501;\nsidebar:\n{sidebar}");
+}

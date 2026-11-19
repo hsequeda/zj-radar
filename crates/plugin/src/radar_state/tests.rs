@@ -2075,24 +2075,92 @@ fn native_update(panes: Vec<(u32, crate::attention::NativePane)>) -> PaneUpdate 
     update
 }
 
+/// Which source a resolved row came from, told apart by the msg each sets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Winner {
+    Pipe,
+    Native,
+    Command,
+}
+
 #[test]
-fn native_attention_wins_over_both_stores() {
+fn source_precedence_is_active_pipe_then_active_native_then_the_rest() {
+    let cases = [
+        ("active pipe beats active native", Some(Status::Done), Some(Status::Running), false, Winner::Pipe),
+        ("active pipe beats native and command", Some(Status::Running), Some(Status::Pending), true, Winner::Pipe),
+        ("active native beats idle pipe", Some(Status::Idle), Some(Status::Pending), false, Winner::Native),
+        ("active native beats command", None, Some(Status::Running), true, Winner::Native),
+        ("native alone (hooks out of reach)", None, Some(Status::Running), false, Winner::Native),
+        ("idle pipe beats idle native", Some(Status::Idle), Some(Status::Idle), false, Winner::Pipe),
+        ("command beats idle native", None, Some(Status::Idle), true, Winner::Command),
+        ("idle pipe beats command", Some(Status::Idle), None, true, Winner::Pipe),
+    ];
+    for (name, pipe, native, command, want) in cases {
+        let mut radar = RadarState::default();
+        radar.tabs_changed(vec![tab(10, 0, "Tab #1", true)]);
+        radar.set_tab_panes_for_position(0, vec![pane(7)]);
+        if command {
+            radar.command_changed(7, &["cargo".into(), "build".into()], true, 1);
+            radar.timer(1 + DEBOUNCE_TICKS, 0);
+        }
+        if let Some(status) = pipe {
+            radar.status_mut().apply(payload_in_repo(7, status, "repo"), 1, 0);
+        }
+        let mut native_pane = native_working("codex", "native");
+        if let Some(status) = native {
+            native_pane.attention.status = status;
+            native_pane.records[0].status = status;
+            native_pane.records[0].msg = Some("native".into());
+        }
+        let mut update = native_update(if native.is_some() { vec![(7, native_pane)] } else { vec![] });
+        update.tab_panes.insert(0, vec![pane(7)]);
+        update.live.insert(7);
+        radar.panes_changed(update, 2 + DEBOUNCE_TICKS, 0, config::NamingMode::Off);
+
+        let obs = radar.resolve(7).unwrap_or_else(|| panic!("{name}: no row"));
+        let got = match (obs.origin, obs.msg.as_str()) {
+            (crate::observation::ObservationOrigin::Command, _) => Winner::Command,
+            (_, "working") => Winner::Pipe,
+            (_, "native") => Winner::Native,
+            other => panic!("{name}: unexpected row {other:?}"),
+        };
+        assert_eq!(got, want, "{name}: resolved {:?} / {:?}", obs.status, obs.msg);
+    }
+}
+
+#[test]
+fn native_row_shows_the_program_and_its_msg() {
     let mut radar = RadarState::default();
     radar.tabs_changed(vec![tab(10, 0, "Tab #1", true)]);
-    radar.status_mut().apply(payload_in_repo(7, Status::Done, "repo"), 1, 0);
-    radar.panes_changed(
-        native_update(vec![(7, native_working("claude-code", "Reading files"))]),
-        2,
-        0,
-        config::NamingMode::Off,
-    );
+    let mut native = native_working("claude-code", "working: Reading files");
+    native.records[0].msg = Some("Reading files".into());
+    radar.panes_changed(native_update(vec![(7, native)]), 2, 0, config::NamingMode::Off);
     let rows = radar.rows(2);
     let display = &rows[0].display;
     assert_eq!(display.status, Status::Running);
     assert_eq!(display.panes[0].kind(), Kind::Claude);
     assert_eq!(display.panes[0].msg(), "Reading files");
     assert!(radar.needs_fast_ticks(), "a native Running row spins");
-    assert!(radar.notify_views().is_empty(), "Zellij notifies natively for a reported pane");
+}
+
+#[test]
+fn notify_skips_panes_the_native_status_wins_but_not_the_pipe() {
+    let mut radar = RadarState::default();
+    radar.tabs_changed(vec![tab(10, 0, "Tab #1", true)]);
+    // Pane 7: hooks and OSC 7501 both report; the pipe wins, so the plugin
+    // still notifies. Pane 8: an idle pipe row under an active native status;
+    // Zellij notifies for it natively.
+    radar.status_mut().apply(payload_in_repo(7, Status::Done, "repo"), 1, 0);
+    radar.status_mut().apply(payload_in_repo(8, Status::Idle, "repo"), 1, 0);
+    radar.panes_changed(
+        native_update(vec![(7, native_working("codex", "x")), (8, native_working("codex", "y"))]),
+        2,
+        0,
+        config::NamingMode::Off,
+    );
+    let views = radar.notify_views();
+    assert_eq!(views.get(&7).map(|o| o.status), Some(Status::Done));
+    assert!(!views.contains_key(&8));
 }
 
 #[test]

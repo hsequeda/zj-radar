@@ -31,7 +31,6 @@ pub(crate) struct PaneAttention {
     /// (`needs approval: …`, `working 40%: …`).
     pub text: String,
     pub app: Option<String>,
-    pub exit_code: Option<i32>,
     pub since_ms: u64,
     /// The program's deciding record, kept after the pane is seen: a focused
     /// pane's Done is seen at once and never shows as the status.
@@ -60,6 +59,8 @@ pub(crate) struct Record {
     pub app: Option<String>,
     pub title: Option<String>,
     pub msg: Option<String>,
+    /// `progress=` (0–100), shown ahead of the row text while working.
+    pub progress: Option<u8>,
     pub updated_ms: u64,
 }
 
@@ -72,6 +73,24 @@ impl Record {
             .find(|s| !s.trim().is_empty())
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// The row text for a record that decides the pane: msg, else title,
+    /// else id. A working record leads with its progress (`40% · msg`);
+    /// a completion never does, so its text matches the label Zellij's
+    /// `remembered` carries and the two ledger edges merge.
+    fn row_text(&self) -> String {
+        let text = [&self.msg, &self.title, &self.id]
+            .into_iter()
+            .flatten()
+            .find(|s| !s.trim().is_empty())
+            .cloned()
+            .unwrap_or_default();
+        match self.progress.map(|p| p.min(100)) {
+            Some(p) if self.status == Status::Running && text.is_empty() => format!("{p}%"),
+            Some(p) if self.status == Status::Running => format!("{p}% · {text}"),
+            _ => text,
+        }
     }
 }
 
@@ -93,12 +112,17 @@ pub(crate) fn kind_for_app(app: &str) -> Kind {
 }
 
 impl NativePane {
-    /// The rail observation for this pane, or `None` when there is nothing to
-    /// show (an idle pane no program reports on). `prev` is the pane's
+    /// The rail observation for this pane, or `None` when no OSC 7501 program
+    /// reports on it. Only program status counts: Zellij's shell-command
+    /// attention stays with the `CommandStore`, and bells, idle rules and
+    /// watches have no program to show. `prev` is the pane's
     /// observation from the previous manifest: an unchanged status keeps its
     /// `last_change_tick`, so the spinner's ease and the rows memo hold.
     pub(crate) fn observation(&self, prev: Option<&TrackedObservation>, tick: u64) -> Option<TrackedObservation> {
         let a = &self.attention;
+        if self.records.is_empty() && a.source != Source::Program {
+            return None;
+        }
         let app = a.app.as_deref().or_else(|| self.records.iter().find_map(|r| r.app.as_deref()));
         let program_kind = app.map_or(Kind::Other, kind_for_app);
         // Zellij raises a pane from its child records only for `blocked` and
@@ -109,19 +133,20 @@ impl NativePane {
         let deciding = (a.source != Source::Program && !has_root)
             .then(|| self.records.iter().enumerate().max_by_key(|(_, r)| r.status))
             .flatten();
-        let (status, origin, kind, msg, since_ms) = match deciding {
-            Some((_, r)) => (r.status, ObservationOrigin::StatusPipe, program_kind, r.label(), r.updated_ms),
-            None => match a.source {
-                Source::Command => (a.status, ObservationOrigin::Command, Kind::Command, a.text.clone(), a.since_ms),
-                Source::Program | Source::Other => {
-                    let msg = if a.text.is_empty() {
-                        self.records.iter().find(|r| r.id.is_none()).map(Record::label).unwrap_or_default()
-                    } else {
-                        a.text.clone()
-                    };
-                    (a.status, ObservationOrigin::StatusPipe, program_kind, msg, a.since_ms)
+        let (status, msg, since_ms) = match deciding {
+            Some((_, r)) => (r.status, r.row_text(), r.updated_ms),
+            None => {
+                let root = self.records.iter().find(|r| r.id.is_none()).map(Record::row_text);
+                if a.source == Source::Program {
+                    let msg = root.filter(|m| !m.is_empty()).unwrap_or_else(|| a.text.clone());
+                    (a.status, msg, a.since_ms)
+                } else {
+                    // Zellij decided on something other than the program: the
+                    // root was seen (a seen Done reads Idle), or a shell command
+                    // or bell took over. The program has nothing active to say.
+                    (Status::Idle, root.unwrap_or_default(), a.since_ms)
                 }
-            },
+            }
         };
         if status == Status::Idle && self.records.is_empty() {
             return None;
@@ -150,16 +175,16 @@ impl NativePane {
             .collect();
         Some(
             TrackedObservation {
-                origin,
+                origin: ObservationOrigin::StatusPipe,
                 status,
                 repo: String::new(),
                 branch: String::new(),
                 msg,
                 task: String::new(),
-                kind,
+                kind: program_kind,
                 last_change_tick: prev.filter(|p| p.status == status).map_or(tick, |p| p.last_change_tick),
                 ever_active: true,
-                exit_code: if origin == ObservationOrigin::Command { a.exit_code } else { None },
+                exit_code: None,
                 completed_epoch_s: status.is_completion().then_some(since_s),
                 pending_epoch_s: (status == Status::Pending).then_some(since_s),
                 // The `✓` gesture still speaks the status pipe (`Effect::BroadcastStatus`),
@@ -281,19 +306,57 @@ mod tests {
     }
 
     #[test]
-    fn command_source_carries_the_exit_code() {
-        let pane = NativePane {
-            attention: PaneAttention {
-                status: Status::Error,
-                source: Source::Command,
-                text: "cargo test".into(),
-                exit_code: Some(101),
-                ..PaneAttention::default()
-            },
-            records: Vec::new(),
+    fn non_program_attention_is_left_to_the_other_sources() {
+        // Shell commands belong to the CommandStore; bells, idle rules and
+        // watches have no program behind them.
+        let cases = [
+            ("shell command, no records", Source::Command, Status::Error, false, None),
+            ("bell, no records", Source::Other, Status::Pending, false, None),
+            ("shell command over an idle root", Source::Command, Status::Error, true, Some(Status::Idle)),
+            ("bell over an idle root", Source::Other, Status::Pending, true, Some(Status::Idle)),
+        ];
+        for (name, source, status, with_root, want) in cases {
+            let pane = NativePane {
+                attention: PaneAttention { status, source, text: "cargo test".into(), ..PaneAttention::default() },
+                records: if with_root { vec![Record { app: Some("pi".into()), ..Record::default() }] } else { vec![] },
+            };
+            let o = pane.observation(None, 1);
+            assert_eq!(o.as_ref().map(|o| o.status), want, "{name}");
+            if let Some(o) = o {
+                assert_eq!((o.origin, o.kind, o.exit_code), (ObservationOrigin::StatusPipe, Kind::Pi, None), "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn row_text_is_msg_with_progress_while_working() {
+        let record = |status, msg: Option<&str>, title: Option<&str>, progress| Record {
+            status,
+            msg: msg.map(Into::into),
+            title: title.map(Into::into),
+            progress,
+            ..Record::default()
         };
+        let cases = [
+            ("msg wins over title", record(Status::Running, Some("Editing"), Some("Turn"), None), "Editing"),
+            ("title when no msg", record(Status::Pending, None, Some("Approve Bash"), None), "Approve Bash"),
+            ("progress leads while working", record(Status::Running, Some("Editing"), None, Some(40)), "40% · Editing"),
+            ("progress alone", record(Status::Running, None, None, Some(7)), "7%"),
+            ("progress capped at 100", record(Status::Running, Some("x"), None, Some(250)), "100% · x"),
+            ("no progress on a completion", record(Status::Done, Some("Shipped"), None, Some(100)), "Shipped"),
+        ];
+        for (name, r, want) in cases {
+            assert_eq!(r.row_text(), want, "{name}");
+        }
+    }
+
+    #[test]
+    fn program_row_uses_the_root_msg_over_zellij_text() {
+        let mut pane = program(Status::Running, "claude-code", "working 40%: Editing main.rs");
+        pane.records[0].msg = Some("Editing main.rs".into());
+        pane.records[0].progress = Some(40);
         let o = pane.observation(None, 1).unwrap();
-        assert_eq!((o.origin, o.kind, o.exit_code), (ObservationOrigin::Command, Kind::Command, Some(101)));
+        assert_eq!(o.msg, "40% · Editing main.rs");
     }
 
     #[test]

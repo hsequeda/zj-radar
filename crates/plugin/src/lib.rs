@@ -390,7 +390,6 @@ fn native_attention(a: PaneAttention) -> attention::PaneAttention {
         },
         text: a.text,
         app: a.detail.app,
-        exit_code: a.detail.exit_code,
         since_ms: a.since_ms,
         remembered: a.remembered.map(|r| attention::Remembered {
             status: native_status(r.status),
@@ -510,6 +509,7 @@ impl ZellijPlugin for State {
                                         app: r.app,
                                         title: r.title,
                                         msg: r.msg,
+                                        progress: r.progress,
                                         updated_ms: r.updated_ms,
                                     })
                                     .collect(),

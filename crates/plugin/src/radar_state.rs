@@ -239,8 +239,9 @@ const FLASH_TICKS: u64 = 2;
 pub(crate) struct RadarState {
     status: StatusStore,
     command: CommandStore,
-    /// The latest manifest's native attention, for each pane it has something
-    /// to show for. Wins over both stores (`resolve`).
+    /// The latest manifest's OSC 7501 program status, for each pane a program
+    /// reports on. Ranks below an active status-pipe observation and above an
+    /// observed command (`resolve`).
     native: HashMap<u32, TrackedObservation>,
     /// The raw native attention `native` derives from: the latest manifest,
     /// with `PaneAttentionChanged` patching a pane's attention in between.
@@ -1107,29 +1108,44 @@ impl RadarState {
         self.last_focused
     }
 
-    /// THE precedence between observation sources: Zellij's native attention
-    /// (which already picked OSC 7501 over a shell command) wins over both
-    /// stores, and a status-pipe observation wins over a command one for the
-    /// same pane id. This is the single definition of the rule — the one place that knows there is more than one store. Both
-    /// consumers (`tab_display`'s roll-up and `notify_views`) read through it, so
-    /// the precedence can never be encoded two different ways and silently drift.
+    /// THE precedence between observation sources, highest first:
+    ///
+    /// 1. an active (non-Idle) status-pipe observation — the hooks carry repo,
+    ///    branch and background tasks, and the `✓` gesture speaks the pipe;
+    /// 2. an active OSC 7501 program status (`native`) — the only source for an
+    ///    agent whose hooks cannot reach this Zellij (a VM, a container, ssh);
+    /// 3. an Idle status-pipe observation;
+    /// 4. an observed command;
+    /// 5. an Idle OSC 7501 root record.
+    ///
+    /// This is the single definition of the rule — the one place that knows
+    /// there is more than one source. Both consumers (`tab_display`'s roll-up
+    /// and `notify_views`) read through it, so the precedence can never be
+    /// encoded two different ways and silently drift.
     fn resolve(&self, pane_id: u32) -> Option<&TrackedObservation> {
-        // ponytail: an idle native pane falls back to the stores, so the pipe and observed commands keep working until they go
-        self.native.get(&pane_id).or_else(|| self.status.get(pane_id)).or_else(|| self.command.get(pane_id))
+        let active = |o: &&TrackedObservation| o.status != Status::Idle;
+        let status = self.status.get(pane_id);
+        let native = self.native.get(&pane_id);
+        status
+            .filter(active)
+            .or_else(|| native.filter(active))
+            .or(status)
+            .or_else(|| self.command.get(pane_id))
+            .or(native)
     }
 
     /// Union of both stores' observations, keyed by pane id, for the notifier.
-    /// A pane CAN appear in both stores; `resolve` applies the system-wide
-    /// "status wins over command" precedence, so a shared id maps to the status
-    /// observation.
+    /// A pane CAN appear in several sources; `resolve` applies the system-wide
+    /// precedence, so a shared id maps to the winning observation.
     pub(crate) fn notify_views(&self) -> std::collections::BTreeMap<u32, &crate::observation::TrackedObservation> {
         let ids: std::collections::BTreeSet<u32> =
             self.command.observations().map(|(id, _)| id).chain(self.status.observations().map(|(id, _)| id)).collect();
-        // Zellij notifies natively (`attention.desktop_notifications`): a pane it
-        // shows attention for never notifies from here.
+        // Zellij notifies natively (`attention.desktop_notifications`): a pane
+        // whose winning observation is its OSC 7501 status never notifies from
+        // here. One the status pipe wins still does.
         ids.into_iter()
-            .filter(|id| !self.native.contains_key(id))
             .filter_map(|id| self.resolve(id).map(|o| (id, o)))
+            .filter(|(id, o)| !self.native.get(id).is_some_and(|n| std::ptr::eq(*o, n)))
             .collect()
     }
 
